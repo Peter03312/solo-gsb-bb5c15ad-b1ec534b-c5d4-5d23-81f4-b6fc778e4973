@@ -77,6 +77,14 @@ export function Workspace({
         <span className="ver-badge">工作版 v{version}</span>
         <span className="ver-badge">已发布第 {view.document.publishedVer} 版</span>
         {view.stats.brokenCount > 0 && <span className="pill broken">待修复 {view.stats.brokenCount} 组</span>}
+        {view.stats.judgmentReviewCount > 0 && (
+          <span className="pill broken">判读意见待复核 {view.stats.judgmentReviewCount} 条</span>
+        )}
+        {(view.stats.judgmentConfirmedCount > 0 || view.stats.judgmentUndecidedCount > 0) && (
+          <span className="ver-badge">
+            判读：已裁定 {view.stats.judgmentConfirmedCount} · 未裁定 {view.stats.judgmentUndecidedCount}
+          </span>
+        )}
         <span className="spacer" />
         <button onClick={() => reload().catch((e: unknown) => raise((e as Error).message))}>刷新</button>
       </div>
@@ -127,7 +135,16 @@ export function Workspace({
         {tab === 'batchedit' && (
           <BatchEditTab view={view} version={version} reload={reload} onError={raise} onNotice={flash} />
         )}
-        {tab === 'collation' && <CollationPage view={view} />}
+        {tab === 'collation' && (
+          <CollationPage
+            view={view}
+            docId={docId}
+            version={version}
+            reload={reload}
+            onError={raise}
+            onNotice={flash}
+          />
+        )}
         {tab === 'publish' && (
           <PublishTab
             view={view}

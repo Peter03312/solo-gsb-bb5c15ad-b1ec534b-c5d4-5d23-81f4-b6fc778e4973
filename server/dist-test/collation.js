@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildView = buildView;
 exports.sameLineOverlap = sameLineOverlap;
 const util_1 = require("./util");
+const judgment_1 = require("./judgment");
 /**
  * 构建校勘对照读模型：
  *  - groups 依底本顺序（ord）排列，逐组给出各抄本文字、异文、缺文、倒置、待修复标记；
@@ -134,6 +135,7 @@ async function buildView(client, doc) {
             cells,
             variant,
             hasMissing,
+            judgment: null,
         };
     });
     // 各抄本原始行序 + 覆盖区间
@@ -164,6 +166,8 @@ async function buildView(client, doc) {
         });
         return { msId: ms.id, lines: msLines };
     });
+    // 判读意见装配（groups[].judgment + 孤儿意见 + 统计）
+    const judgmentSummary = await (0, judgment_1.attachJudgmentsToView)(client, doc.id, groupViews, mss);
     return {
         document: {
             id: doc.id,
@@ -180,11 +184,15 @@ async function buildView(client, doc) {
         })),
         groups: groupViews,
         rawByMs,
+        orphanJudgments: judgmentSummary.orphans,
         stats: {
             manuscriptCount: mss.length,
             lineCount: lines.length,
             groupCount: groups.length,
             brokenCount: groups.filter((g) => g.broken).length,
+            judgmentConfirmedCount: judgmentSummary.confirmed,
+            judgmentUndecidedCount: judgmentSummary.undecided,
+            judgmentReviewCount: judgmentSummary.review,
         },
     };
 }

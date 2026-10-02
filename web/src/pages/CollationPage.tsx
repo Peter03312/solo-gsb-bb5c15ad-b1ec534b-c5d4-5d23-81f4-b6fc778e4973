@@ -1,12 +1,31 @@
 import type { CollationView } from '../types';
+import { JudgmentCell, OrphanJudgments } from './JudgmentBox';
 
 /**
  * 对照页（读模型）：
- *  上：依底本顺序的对应组总表（异文 / 缺文 / 倒置 / 待修复）；
+ *  上：依底本顺序的对应组总表（异文 / 缺文 / 倒置 / 待修复 / 判读意见）；
  *  下：各抄本原始行序，已归组部分加底色——未归组文字自然完整可见。
- * 同时用于已发布旧版（只读快照）。
+ * 同时用于已发布旧版（只读快照，意见为发布当时固化状态）。
  */
-export function CollationPage({ view, frozen }: { view: CollationView; frozen?: boolean }) {
+export function CollationPage({
+  view,
+  frozen,
+  docId,
+  version,
+  reload,
+  onError,
+  onNotice,
+}: {
+  view: CollationView;
+  frozen?: boolean;
+  docId?: number;
+  version?: number;
+  reload?: () => Promise<void>;
+  onError?: (msg: string, details?: unknown) => void;
+  onNotice?: (msg: string) => void;
+}) {
+  const editable =
+    !frozen && docId != null && version != null && reload != null && onError != null && onNotice != null;
   return (
     <div>
       <div className="legend">
@@ -15,6 +34,7 @@ export function CollationPage({ view, frozen }: { view: CollationView; frozen?: 
         <span className="pill missing">缺文</span>
         <span className="pill invert">倒置</span>
         <span className="pill broken">待修复</span>
+        <span className="pill ok">已裁定意见</span>
         {frozen && <span className="pill ok">已发布快照（只读）</span>}
       </div>
 
@@ -74,6 +94,21 @@ export function CollationPage({ view, frozen }: { view: CollationView; frozen?: 
                 {!g.variant && !g.hasMissing && !g.inverted && !g.broken && (
                   <span className="muted">同</span>
                 )}
+                <div className="judgment-cell">
+                  {editable ? (
+                    <JudgmentCell
+                      docId={docId!}
+                      view={view}
+                      group={g}
+                      version={version!}
+                      reload={reload!}
+                      onError={onError!}
+                      onNotice={onNotice!}
+                    />
+                  ) : (
+                    <JudgmentCell docId={0} view={view} group={g} frozen reload={async () => undefined} onError={() => undefined} onNotice={() => undefined} />
+                  )}
+                </div>
               </td>
             </tr>
           ))}
@@ -86,6 +121,19 @@ export function CollationPage({ view, frozen }: { view: CollationView; frozen?: 
           )}
         </tbody>
       </table>
+
+      {editable ? (
+        <OrphanJudgments
+          docId={docId!}
+          view={view}
+          version={version!}
+          reload={reload!}
+          onError={onError!}
+          onNotice={onNotice!}
+        />
+      ) : (
+        <OrphanJudgments docId={0} view={view} frozen reload={async () => undefined} onError={() => undefined} onNotice={() => undefined} />
+      )}
 
       <div className="raw-section">
         <h3>各抄本原文（原始行序；底色为已归组文字，其余为未归组文字）</h3>

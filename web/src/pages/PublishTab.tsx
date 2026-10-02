@@ -33,7 +33,8 @@ export function PublishTab({
     view.stats.manuscriptCount >= 2 &&
     view.document.baseMsId != null &&
     view.stats.groupCount > 0 &&
-    view.stats.brokenCount === 0;
+    view.stats.brokenCount === 0 &&
+    view.stats.judgmentReviewCount === 0;
 
   const publish = async () => {
     setBusy(true);
@@ -60,6 +61,13 @@ export function PublishTab({
         {view.stats.brokenCount > 0 && (
           <div className="error-box">
             仍有 {view.stats.brokenCount} 个对应组<strong>待修复</strong>。修复前不得发布新校勘版。
+          </div>
+        )}
+        {view.stats.judgmentReviewCount > 0 && (
+          <div className="error-box">
+            仍有 <strong>{view.stats.judgmentReviewCount}</strong> 条判读意见<strong>待复核</strong>
+            （含原组已消失的孤儿意见）。须到“校勘对照”页逐条<strong>重新确认或撤回</strong>后才能发布；
+            未裁定意见不影响发布。
           </div>
         )}
         {view.stats.groupCount === 0 && (

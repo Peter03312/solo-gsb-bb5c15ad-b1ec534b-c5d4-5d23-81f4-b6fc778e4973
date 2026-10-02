@@ -11,6 +11,7 @@ import {
   RawLineView,
 } from './types';
 import { charLen, rangesOverlap, sliceCp } from './util';
+import { attachJudgmentsToView } from './judgment';
 
 /**
  * 构建校勘对照读模型：
@@ -166,6 +167,7 @@ export async function buildView(
       cells,
       variant,
       hasMissing,
+      judgment: null,
     };
   });
 
@@ -198,6 +200,9 @@ export async function buildView(
     return { msId: ms.id, lines: msLines };
   });
 
+  // 判读意见装配（groups[].judgment + 孤儿意见 + 统计）
+  const judgmentSummary = await attachJudgmentsToView(client, doc.id, groupViews, mss);
+
   return {
     document: {
       id: doc.id,
@@ -214,11 +219,15 @@ export async function buildView(
     })),
     groups: groupViews,
     rawByMs,
+    orphanJudgments: judgmentSummary.orphans,
     stats: {
       manuscriptCount: mss.length,
       lineCount: lines.length,
       groupCount: groups.length,
       brokenCount: groups.filter((g) => g.broken).length,
+      judgmentConfirmedCount: judgmentSummary.confirmed,
+      judgmentUndecidedCount: judgmentSummary.undecided,
+      judgmentReviewCount: judgmentSummary.review,
     },
   };
 }

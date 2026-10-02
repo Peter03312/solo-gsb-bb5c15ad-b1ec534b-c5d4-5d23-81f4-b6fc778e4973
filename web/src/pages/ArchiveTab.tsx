@@ -111,7 +111,8 @@ export function ArchiveTab({
               ✓ 已导入为文献 #{imported.documentId}「{imported.title}」：抄本{' '}
               {imported.imported.manuscriptCount} 份 · 行 {imported.imported.lineCount} 条 · 对应组{' '}
               {imported.imported.groupCount} 个（待修复 {imported.imported.brokenGroupCount}）· 片段{' '}
-              {imported.imported.fragmentCount} 条（缺文 {imported.imported.missingCount}）· 已发布版{' '}
+              {imported.imported.fragmentCount} 条（缺文 {imported.imported.missingCount}）· 判读意见{' '}
+              {imported.imported.judgmentCount ?? 0} 条（待复核 {imported.imported.judgmentReviewCount ?? 0}）· 已发布版{' '}
               {imported.imported.editionCount} 个；工作版 v{imported.version}，已发布至第{' '}
               {imported.publishedVer} 版。
             </div>

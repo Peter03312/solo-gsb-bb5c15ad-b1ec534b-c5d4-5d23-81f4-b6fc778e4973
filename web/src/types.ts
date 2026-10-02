@@ -9,6 +9,34 @@ export interface CellView {
   oobEnd?: number;
 }
 
+export interface JudgmentView {
+  id: number;
+  status: 'confirmed' | 'undecided' | 'review';
+  decided: boolean;
+  reason: string;
+  quoteText: string;
+  needsReview: boolean;
+  reviewReason: string | null;
+  frozen: boolean;
+  chosenMsId: number | null;
+  chosenMsName: string | null;
+  chosenLineNo: number | null;
+  chosenStartCp: number | null;
+  chosenEndCp: number | null;
+  baseMsId: number | null;
+  baseMsName: string | null;
+  baseLineNo: number | null;
+  baseStartCp: number | null;
+  baseEndCp: number | null;
+  baseText: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OrphanJudgmentView extends JudgmentView {
+  lastOrd: number | null;
+}
+
 export interface GroupView {
   id: number;
   ord: number;
@@ -18,6 +46,7 @@ export interface GroupView {
   cells: CellView[];
   variant: boolean;
   hasMissing: boolean;
+  judgment: JudgmentView | null;
 }
 
 export interface CoveredSpan {
@@ -45,7 +74,16 @@ export interface CollationView {
   manuscripts: Array<{ id: number; name: string; position: number; isBase: boolean }>;
   groups: GroupView[];
   rawByMs: Array<{ msId: number; lines: RawLineView[] }>;
-  stats: { manuscriptCount: number; lineCount: number; groupCount: number; brokenCount: number };
+  orphanJudgments: OrphanJudgmentView[];
+  stats: {
+    manuscriptCount: number;
+    lineCount: number;
+    groupCount: number;
+    brokenCount: number;
+    judgmentConfirmedCount: number;
+    judgmentUndecidedCount: number;
+    judgmentReviewCount: number;
+  };
 }
 
 export interface FragmentDraft {
@@ -457,6 +495,24 @@ export interface ImportArchiveResult {
     brokenGroupCount: number;
     fragmentCount: number;
     missingCount: number;
+    judgmentCount: number;
+    judgmentReviewCount: number;
     editionCount: number;
   };
+}
+
+// ---- 判读意见 ----
+
+export interface JudgmentWriteResult {
+  ok: boolean;
+  version: number;
+  decided: boolean;
+  quoteText: string;
+}
+
+export interface JudgmentReconfirmResult {
+  ok: boolean;
+  version: number;
+  groupId: number;
+  groupOrd: number;
 }

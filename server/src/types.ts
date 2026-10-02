@@ -39,6 +39,33 @@ export interface FragmentRow {
   missing: boolean;
 }
 
+// ---- 判读意见（整理者对工作版对应组的判读；每组至多一条）----
+
+export interface JudgmentRow {
+  id: number;
+  doc_id: number;
+  group_id: number | null;
+  chosen_ms_id: number | null;
+  chosen_line_id: number | null;
+  decided: boolean;
+  reason: string;
+  quote_text: string;
+  base_ms_id: number | null;
+  base_line_no: number | null;
+  base_start_cp: number | null;
+  base_end_cp: number | null;
+  base_text: string;
+  chosen_line_no: number | null;
+  chosen_start_cp: number | null;
+  chosen_end_cp: number | null;
+  needs_review: boolean;
+  review_reason: string;
+  frozen: boolean;
+  last_ord: number | null;
+  created_at: string | Date;
+  updated_at: string | Date;
+}
+
 // ---- 补配：按完好对应组的底本文字，在目标抄本原始行文的空闲区间里预配片段 ----
 
 export type SupplementGroupStatus = 'unique' | 'multiple' | 'none' | 'conflict';
@@ -287,6 +314,46 @@ export interface GroupView {
   cells: CellView[];
   variant: boolean;          // 存在异文
   hasMissing: boolean;       // 存在显式缺文
+  /** 该组当前的判读意见（无意见时为 null；每组至多一条）。 */
+  judgment: JudgmentView | null;
+}
+
+/**
+ * 判读意见读模型（页面与 HTTP API 同构；已发布快照中冻结同形）。
+ * status: confirmed=已裁定有效；undecided=明确未裁定（可发布）；review=待复核（须重新确认 / 撤回才能发布）。
+ */
+export interface JudgmentView {
+  id: number;
+  status: 'confirmed' | 'undecided' | 'review';
+  decided: boolean;
+  reason: string;
+  /** 已裁定意见的引用文字（冻结当时片段文字；待复核时仍原样展示，供整理者核对）。 */
+  quoteText: string;
+  needsReview: boolean;
+  reviewReason: string | null;
+  frozen: boolean;
+  /** 已裁定：所选抄本。 */
+  chosenMsId: number | null;
+  chosenMsName: string | null;
+  /** 已裁定所选片段的当前位置（待复核 / 越界时可能为 null 或不完整，仅作追溯）。 */
+  chosenLineNo: number | null;
+  chosenStartCp: number | null;
+  chosenEndCp: number | null;
+  /** 组锚点（底本片段：抄本 + 原始行号 + 码点区间 + 文字）。 */
+  baseMsId: number | null;
+  baseMsName: string | null;
+  baseLineNo: number | null;
+  baseStartCp: number | null;
+  baseEndCp: number | null;
+  baseText: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 失去组归属的判读意见（组已删 / 整批重存后无法唯一对应）；待复核，不静默移到别组。 */
+export interface OrphanJudgmentView extends JudgmentView {
+  /** 最近一次挂载的组序号（仅展示，可能为 null）。 */
+  lastOrd: number | null;
 }
 
 export interface RawLineView {
@@ -309,11 +376,17 @@ export interface CollationView {
   groups: GroupView[];
   /** 各抄本原始行序视图（含未归组文字）。 */
   rawByMs: Array<{ msId: number; lines: RawLineView[] }>;
+  /** 失去组归属的判读意见（整批重存无法唯一对应 / 组被删除）；待复核，不静默移到别组。 */
+  orphanJudgments: OrphanJudgmentView[];
   stats: {
     manuscriptCount: number;
     lineCount: number;
     groupCount: number;
     brokenCount: number;
+    /** 判读意见统计：confirmed 已裁定 / undecided 未裁定 / review 待复核（含孤儿）。 */
+    judgmentConfirmedCount: number;
+    judgmentUndecidedCount: number;
+    judgmentReviewCount: number;
   };
 }
 
@@ -354,7 +427,33 @@ export interface ArchiveGroup {
 export interface ArchiveEdition {
   editionNo: number;          // 发布版编号（自 1 连续）
   createdAt: string | null;   // 发布时间（ISO）
-  snapshot: unknown;          // 发布定稿快照（CollationView）
+  snapshot: unknown;          // 发布定稿快照（CollationView，含该版固化的判读意见）
+}
+
+/**
+ * 工作版判读意见（归档层）。
+ * 组归属以「底本片段位置（msRef + 行号 + 码点区间 + 文字）」为锚点记录，
+ * 导入时按新文献组唯一配对挂载；无法唯一配对则保留为待复核孤儿，不静默移到别组。
+ * 旧格式归档（formatVersion=1 且无本节）仍可导入，视为无工作版意见。
+ */
+export interface ArchiveJudgment {
+  decided: boolean;
+  reason: string;
+  quoteText: string;
+  needsReview: boolean;
+  reviewReason: string;
+  frozen: boolean;
+  baseMsRef: number | null;
+  baseLineNo: number | null;
+  baseStartCp: number | null;
+  baseEndCp: number | null;
+  baseText: string;
+  chosenMsRef: number | null;
+  chosenLineNo: number | null;
+  chosenStartCp: number | null;
+  chosenEndCp: number | null;
+  /** 最近一次挂载的组序号（孤儿意见的追溯信息，可空）。 */
+  lastOrd: number | null;
 }
 
 export interface CollationArchive {
@@ -370,6 +469,8 @@ export interface CollationArchive {
   manuscripts: ArchiveManuscript[];
   lines: ArchiveLine[];
   groups: ArchiveGroup[];
+  /** 工作版判读意见（旧格式归档无此节，导入时按无意见处理）。 */
+  judgments?: ArchiveJudgment[];
   editions: ArchiveEdition[];
 }
 

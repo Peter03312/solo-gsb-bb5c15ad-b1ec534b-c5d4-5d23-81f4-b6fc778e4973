@@ -11,6 +11,7 @@ const reline_1 = require("./reline");
 const batchedit_1 = require("./batchedit");
 const restore_1 = require("./restore");
 const archive_1 = require("./archive");
+const judgment_1 = require("./judgment");
 const util_1 = require("./util");
 const repo_1 = require("./repo");
 exports.router = (0, express_1.Router)();
@@ -120,6 +121,8 @@ exports.router.put('/documents/:id/base', wrap(async (req, res) => {
            SELECT f.group_id FROM fragments f
            WHERE f.doc_id=$1 AND f.ms_id=$2 AND f.missing=FALSE AND f.line_id IS NOT NULL
          )`, [id, msId]);
+        // 判读意见：底本锚点切到新底本（完好组刷新位置/文字）；缺新底本片段的组待复核，不静默迁移
+        await (0, judgment_1.retargetJudgmentsForBaseSwitch)(c, id, msId);
         await (0, repo_1.bumpVersion)(c, id);
     });
     res.json({ ok: true });
@@ -201,6 +204,7 @@ exports.router.put('/lines/:lineId', wrap(async (req, res) => {
             await c.query('UPDATE grp SET broken=TRUE WHERE id = ANY($1::bigint[])', [[...touchedGroups]]);
         }
         await c.query('UPDATE lines SET content=$1 WHERE id=$2', [newContent, lineId]);
+        await (0, judgment_1.reconcileJudgments)(c, doc.id); // 随片段平移刷新锚点；受影响 / 引用文字已变 → 待复核
         await (0, repo_1.bumpVersion)(c, doc.id);
     });
     res.json({ ok: true });
@@ -226,6 +230,13 @@ exports.router.put('/documents/:id/groups', wrap(async (req, res) => {
                 ords,
             });
         }
+        // 抓取整批重存前的组 / 片段 / 行快照（判读意见按底本位置唯一配对重新挂载用）
+        const oldGroupSnapshot = {
+            groups: (await c.query('SELECT id, ord, broken FROM grp WHERE doc_id=$1 ORDER BY ord', [id])).rows,
+            fragments: (await c.query('SELECT id, group_id, ms_id, line_id, start_cp, end_cp, missing FROM fragments WHERE doc_id=$1', [id])).rows,
+            lines,
+            baseMsId: doc.base_ms_id,
+        };
         await c.query('DELETE FROM grp WHERE doc_id=$1', [id]);
         for (const g of groups) {
             const { rows: gr } = await c.query('INSERT INTO grp (doc_id, ord, broken) VALUES ($1,$2,FALSE) RETURNING id', [id, g.ord]);
@@ -235,6 +246,9 @@ exports.router.put('/documents/:id/groups', wrap(async (req, res) => {
              VALUES ($1,$2,$3,$4,$5,$6,$7)`, [gid, id, f.msId, f.missing ? null : f.lineId, f.missing ? null : f.startCp, f.missing ? null : f.endCp, !!f.missing]);
             }
         }
+        // 整批重存更换全部组 id：按版本对照同款“底本位置唯一配对”重挂意见；
+        // 对应不唯一 / 引用文字已变 / 原已待复核 → 孤儿待复核，绝不静默移到别组。
+        await (0, judgment_1.reattachJudgmentsForRegroup)(c, id, oldGroupSnapshot);
         await (0, repo_1.bumpVersion)(c, id);
     });
     res.json({ ok: true });
@@ -281,6 +295,8 @@ exports.router.put('/documents/:id/groups/:groupId/repair', wrap(async (req, res
            VALUES ($1,$2,$3,$4,$5,$6,$7)`, [groupId, id, f.msId, f.missing ? null : f.lineId, f.missing ? null : f.startCp, f.missing ? null : f.endCp, !!f.missing]);
         }
         await c.query('UPDATE grp SET broken=FALSE WHERE id=$1', [groupId]);
+        // 判读意见：修复不清待复核闩锁（须人重新确认 / 撤回）；未闩锁的意见随新片段核对引用
+        await (0, judgment_1.reconcileJudgments)(c, id);
         await (0, repo_1.bumpVersion)(c, id);
     });
     res.json({ ok: true });
@@ -292,10 +308,192 @@ exports.router.delete('/documents/:id/groups/:groupId', wrap(async (req, res) =>
     await (0, db_1.withTx)(async (c) => {
         const doc = await (0, repo_1.lockDoc)(c, id);
         (0, repo_1.checkVersion)(doc, req.body?.expectedVersion);
-        const { rows } = await c.query('SELECT 1 FROM grp WHERE id=$1 AND doc_id=$2', [groupId, id]);
+        const { rows } = await c.query('SELECT ord FROM grp WHERE id=$1 AND doc_id=$2', [groupId, id]);
         if (rows.length === 0)
             throw new util_1.HttpError(404, `对应组 #${groupId} 不存在`);
+        // 先把本组判读意见标为待复核孤儿（grp 删除会把 group_id 置空；不得静默移到别组）
+        await c.query(`UPDATE group_judgments
+           SET group_id=NULL, chosen_line_id=NULL, needs_review=TRUE,
+               review_reason=$1, last_ord=COALESCE(last_ord, $2), updated_at=now()
+         WHERE group_id=$3 AND doc_id=$4`, [`原第 ${rows[0].ord} 组已删除：引用失效，请重新确认或撤回本意见（不会移到其他组）`, rows[0].ord, groupId, id]);
         await c.query('DELETE FROM grp WHERE id=$1', [groupId]);
+        await (0, repo_1.bumpVersion)(c, id);
+    });
+    res.json({ ok: true });
+}));
+// ---------- 判读意见（每组至多一条；已裁定 = 选定一份有有效片段的抄本，或明确未裁定） ----------
+/**
+ * 写入 / 修改某组判读意见：
+ *   PUT /api/documents/:id/groups/:groupId/judgment
+ *   { expectedVersion, decided, chosenMsId?, reason? }
+ * - decided=true：须给 chosenMsId，且该抄本在本组有有效（非缺文、在行内）片段；reason 必填；
+ *   引用文字由服务端从当前片段固化（不信任客户端）。
+ * - decided=false：明确标为未裁定（reason 可空）。
+ * - 每组至多一条：重复写入即覆盖旧意见；整次校验失败（非法选择 / 组待修复）→ 400/409，不改动数据。
+ */
+exports.router.put('/documents/:id/groups/:groupId/judgment', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const groupId = Number(req.params.groupId);
+    const result = await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.lockDoc)(c, id);
+        (0, repo_1.checkVersion)(doc, req.body?.expectedVersion);
+        const mss = await (0, repo_1.loadMss)(c, id);
+        const lines = await (0, repo_1.loadLines)(c, mss.map((m) => m.id));
+        const lineById = new Map(lines.map((l) => [l.id, l]));
+        const { rows: grow } = await c.query('SELECT id, ord, broken FROM grp WHERE id=$1 AND doc_id=$2 FOR UPDATE', [groupId, id]);
+        if (grow.length === 0)
+            throw new util_1.HttpError(404, `对应组 #${groupId} 不存在`);
+        const g = grow[0];
+        if (g.broken) {
+            throw new util_1.HttpError(409, `第 ${g.ord} 组待修复，不能对待修复组下判读意见；请先修复该组`, { code: 'JUDGMENT_GROUP_BROKEN', groupOrd: g.ord });
+        }
+        const decided = req.body?.decided === true;
+        const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+        const chosenMsId = req.body?.chosenMsId;
+        // 组底本片段锚点
+        let baseMsId = doc.base_ms_id;
+        let baseLineNo = null;
+        let baseStartCp = null;
+        let baseEndCp = null;
+        let baseText = '';
+        if (baseMsId != null) {
+            const { rows: bf } = await c.query('SELECT line_id, start_cp, end_cp FROM fragments WHERE group_id=$1 AND ms_id=$2 AND missing=FALSE', [groupId, baseMsId]);
+            const bfr = bf[0];
+            const bln = bfr?.line_id != null ? lineById.get(bfr.line_id) : undefined;
+            if (!bfr || !bln || bfr.start_cp == null || bfr.end_cp == null || bln.ms_id !== baseMsId) {
+                throw new util_1.HttpError(409, `第 ${g.ord} 组底本片段无效，无法下判读意见；请先修复该组`, {
+                    code: 'JUDGMENT_GROUP_BROKEN',
+                    groupOrd: g.ord,
+                });
+            }
+            const len = (0, util_1.charLen)(bln.content);
+            if (bfr.start_cp < 0 || bfr.end_cp <= bfr.start_cp || bfr.end_cp > len) {
+                throw new util_1.HttpError(409, `第 ${g.ord} 组底本片段越界，无法下判读意见；请先修复该组`, {
+                    code: 'JUDGMENT_GROUP_BROKEN',
+                    groupOrd: g.ord,
+                });
+            }
+            baseLineNo = bln.line_no;
+            baseStartCp = bfr.start_cp;
+            baseEndCp = bfr.end_cp;
+            baseText = (0, util_1.sliceCp)(bln.content, bfr.start_cp, bfr.end_cp);
+        }
+        let chosenLineId = null;
+        let chosenLineNo = null;
+        let chosenStartCp = null;
+        let chosenEndCp = null;
+        let quoteText = '';
+        if (decided) {
+            if (!(0, util_1.isInt)(chosenMsId) || !mss.some((m) => m.id === chosenMsId)) {
+                throw new util_1.HttpError(400, '已裁定意见须选定一份属于本文献的抄本（chosenMsId 为整数）');
+            }
+            if (!reason)
+                throw new util_1.HttpError(400, '已裁定意见须填写理由（reason）');
+            const { rows: cf } = await c.query('SELECT line_id, start_cp, end_cp, missing FROM fragments WHERE group_id=$1 AND ms_id=$2', [groupId, chosenMsId]);
+            const cfr = cf[0];
+            const cln = cfr && !cfr.missing && cfr.line_id != null ? lineById.get(cfr.line_id) : undefined;
+            if (!cfr || cfr.missing) {
+                throw new util_1.HttpError(400, `第 ${g.ord} 组中抄本「${mss.find((m) => m.id === chosenMsId)?.name ?? chosenMsId}」此处为缺文，没有可引用的有效片段，不能选为判读依据`, { code: 'JUDGMENT_NO_FRAGMENT', groupOrd: g.ord });
+            }
+            if (!cln || cln.ms_id !== chosenMsId || cfr.start_cp == null || cfr.end_cp == null) {
+                throw new util_1.HttpError(400, `第 ${g.ord} 组所选抄本片段引用失效，不能选为判读依据`, {
+                    code: 'JUDGMENT_NO_FRAGMENT',
+                    groupOrd: g.ord,
+                });
+            }
+            const len = (0, util_1.charLen)(cln.content);
+            if (cfr.start_cp < 0 || cfr.end_cp <= cfr.start_cp || cfr.end_cp > len) {
+                throw new util_1.HttpError(400, `第 ${g.ord} 组所选抄本片段越界（组待修复），不能选为判读依据`, {
+                    code: 'JUDGMENT_NO_FRAGMENT',
+                    groupOrd: g.ord,
+                });
+            }
+            chosenLineId = cln.id;
+            chosenLineNo = cln.line_no;
+            chosenStartCp = cfr.start_cp;
+            chosenEndCp = cfr.end_cp;
+            quoteText = (0, util_1.sliceCp)(cln.content, cfr.start_cp, cfr.end_cp);
+        }
+        // upsert：每组至多一条（部分唯一索引 uq_judgment_group 兜底）
+        const { rows: existing } = await c.query('SELECT id FROM group_judgments WHERE group_id=$1 AND doc_id=$2 FOR UPDATE', [groupId, id]);
+        if (existing.length > 0) {
+            await c.query(`UPDATE group_judgments SET
+             chosen_ms_id=$1, chosen_line_id=$2, decided=$3, reason=$4, quote_text=$5,
+             base_ms_id=$6, base_line_no=$7, base_start_cp=$8, base_end_cp=$9, base_text=$10,
+             chosen_line_no=$11, chosen_start_cp=$12, chosen_end_cp=$13,
+             needs_review=FALSE, review_reason='', frozen=FALSE, last_ord=$14, updated_at=now()
+           WHERE id=$15`, [
+                decided ? chosenMsId : null, chosenLineId, decided, decided ? reason : reason,
+                quoteText, baseMsId, baseLineNo, baseStartCp, baseEndCp, baseText,
+                chosenLineNo, chosenStartCp, chosenEndCp, g.ord, existing[0].id,
+            ]);
+        }
+        else {
+            await c.query(`INSERT INTO group_judgments
+             (doc_id, group_id, chosen_ms_id, chosen_line_id, decided, reason, quote_text,
+              base_ms_id, base_line_no, base_start_cp, base_end_cp, base_text,
+              chosen_line_no, chosen_start_cp, chosen_end_cp, needs_review, frozen, last_ord)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,FALSE,FALSE,$16)`, [
+                id, groupId, decided ? chosenMsId : null, chosenLineId, decided, reason,
+                quoteText, baseMsId, baseLineNo, baseStartCp, baseEndCp, baseText,
+                chosenLineNo, chosenStartCp, chosenEndCp, g.ord,
+            ]);
+        }
+        await (0, repo_1.bumpVersion)(c, id);
+        const after = await (0, repo_1.getDoc)(c, id);
+        return { version: after.version, decided, quoteText };
+    });
+    res.json({ ok: true, ...result });
+}));
+/**
+ * 重新确认一条待复核意见：
+ *   POST /api/documents/:id/judgments/:judgmentId/reconfirm
+ *   { expectedVersion, attachGroupId? }   // 孤儿意见可由人指定重挂的组（可选；不给则按锚点自动唯一配对）
+ * 重新核对当前工作版：组完好、所选片段仍有效且引用文字未变 → 清除待复核；
+ * 无法确认 → 409 JUDGMENT_RECHECK_FAILED（不改动数据）。意见不存在 → 404。
+ */
+exports.router.post('/documents/:id/judgments/:judgmentId/reconfirm', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const judgmentId = Number(req.params.judgmentId);
+    const result = await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.lockDoc)(c, id);
+        (0, repo_1.checkVersion)(doc, req.body?.expectedVersion);
+        let attachGroupId;
+        if (req.body?.attachGroupId !== undefined && req.body?.attachGroupId !== null) {
+            if (!(0, util_1.isInt)(req.body.attachGroupId) || req.body.attachGroupId <= 0) {
+                throw new util_1.HttpError(400, 'attachGroupId 必须是正整数（或省略以自动唯一配对）');
+            }
+            attachGroupId = req.body.attachGroupId;
+        }
+        try {
+            const r = await (0, judgment_1.reconfirmJudgment)(c, id, judgmentId, { attachGroupId });
+            await (0, repo_1.bumpVersion)(c, id);
+            const after = await (0, repo_1.getDoc)(c, id);
+            return { version: after.version, groupId: r.groupId, groupOrd: r.ord };
+        }
+        catch (e) {
+            if (e instanceof util_1.HttpError)
+                throw e;
+            throw new util_1.HttpError(409, `判读意见未能在当前工作版重新确认：${e.message}；数据未改动`, { code: 'JUDGMENT_RECHECK_FAILED' });
+        }
+    });
+    res.json({ ok: true, ...result });
+}));
+/**
+ * 撤回（删除）一条判读意见：
+ *   DELETE /api/documents/:id/judgments/:judgmentId  { expectedVersion }
+ * 待复核意见撤回后即可发布；撤回后该组恢复为“无意见”，可重新判读。
+ */
+exports.router.delete('/documents/:id/judgments/:judgmentId', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const judgmentId = Number(req.params.judgmentId);
+    await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.lockDoc)(c, id);
+        (0, repo_1.checkVersion)(doc, req.body?.expectedVersion);
+        const { rows } = await c.query('SELECT 1 FROM group_judgments WHERE id=$1 AND doc_id=$2', [judgmentId, id]);
+        if (rows.length === 0)
+            throw new util_1.HttpError(404, `判读意见 #${judgmentId} 不存在`);
+        await c.query('DELETE FROM group_judgments WHERE id=$1 AND doc_id=$2', [judgmentId, id]);
         await (0, repo_1.bumpVersion)(c, id);
     });
     res.json({ ok: true });
@@ -431,6 +629,8 @@ exports.router.post('/documents/:id/supplement', wrap(async (req, res) => {
             await c.query(`INSERT INTO fragments (group_id, doc_id, ms_id, line_id, start_cp, end_cp, missing)
            VALUES ($1,$2,$3,$4,$5,$6,FALSE)`, [sel.groupId, id, sel.msId, sel.lineId, sel.startCp, sel.endCp]);
         }
+        // 补配只增加片段：已有意见所选片段不变，对账保持其有效状态
+        await (0, judgment_1.reconcileJudgments)(c, id);
         await (0, repo_1.bumpVersion)(c, id);
         const after = await (0, repo_1.getDoc)(c, id);
         return { applied: selections.length, version: after.version };
@@ -480,6 +680,8 @@ exports.router.post('/documents/:id/reline', wrap(async (req, res) => {
             basis: req.body?.basis,
         });
         await (0, reline_1.applyReLinePlan)(c, built);
+        // 行界调整：未跨点片段随字迁移（保留 id，锚点刷新）；跨点组待修复 → 意见待复核
+        await (0, judgment_1.reconcileJudgments)(c, id);
         await (0, repo_1.bumpVersion)(c, id); // 整次成功只推进一次
         const after = await (0, repo_1.getDoc)(c, id);
         return { version: after.version, result: built.plan };
@@ -532,6 +734,8 @@ exports.router.post('/documents/:id/lines/batch-edit', wrap(async (req, res) => 
             basis: req.body?.basis,
         });
         await (0, batchedit_1.applyBatchEditPlan)(c, plan);
+        // 批量行改：片段随累计位移平移（锚点刷新）；相交 / 缩行越界组待修复 → 意见待复核
+        await (0, judgment_1.reconcileJudgments)(c, id);
         await (0, repo_1.bumpVersion)(c, id); // 整批成功只推进一次
         const after = await (0, repo_1.getDoc)(c, id);
         return {
@@ -564,6 +768,11 @@ exports.router.post('/documents/:id/publish', wrap(async (req, res) => {
         const { rows: gc } = await c.query('SELECT count(*)::int AS n FROM grp WHERE doc_id=$1', [id]);
         if (gc[0].n === 0)
             throw new util_1.HttpError(400, '还没有任何对应组，不能发布');
+        // 判读意见门禁：待复核意见（含失去组归属的孤儿）须重新确认或撤回才能发布；未裁定可发布
+        const { rows: jr } = await c.query('SELECT count(*)::int AS n FROM group_judgments WHERE doc_id=$1 AND needs_review=TRUE', [id]);
+        if (jr[0].n > 0) {
+            throw new util_1.HttpError(409, `尚有 ${jr[0].n} 条判读意见待复核：须逐条重新确认或撤回后才能发布新校勘版（未裁定意见不影响发布）`, { code: 'PUBLISH_WITH_PENDING_REVIEW', pendingReview: jr[0].n });
+        }
         const editionNo = doc.published_ver + 1;
         await c.query('UPDATE documents SET published_ver=$1 WHERE id=$2', [editionNo, id]);
         // 快照固化“发布定稿”状态：先落版本号（乐观锁 +1），再构建读模型，
@@ -642,6 +851,8 @@ exports.router.post('/documents/:id/editions/:no/restore', wrap(async (req, res)
         // 解析快照并以同一套归组规则校验；无法构成合法归组 → 409 RESTORE_SNAPSHOT_INVALID（此前无任何写入）
         const plan = (0, restore_1.buildRestorePlan)(rows[0].snapshot);
         await (0, restore_1.applyRestore)(c, id, plan);
+        // 恢复该版时同步恢复其固化判读意见（按底本位置唯一配对挂到重建后的组；意见随版冻结）
+        const judgmentSync = await (0, judgment_1.syncJudgmentsFromSnapshot)(c, id, rows[0].snapshot);
         await (0, repo_1.bumpVersion)(c, id); // 成功后工作版版本号只前进一次
         const after = await (0, repo_1.getDoc)(c, id);
         return {
@@ -654,6 +865,7 @@ exports.router.post('/documents/:id/editions/:no/restore', wrap(async (req, res)
                 fragmentCount: plan.stats.fragmentCount,
                 missingCount: plan.stats.missingCount,
                 baseMsId: plan.baseMsId,
+                judgmentCount: judgmentSync.restored,
             },
         };
     });

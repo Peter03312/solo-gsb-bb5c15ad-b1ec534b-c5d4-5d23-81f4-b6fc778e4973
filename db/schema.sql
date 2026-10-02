@@ -77,6 +77,39 @@ CREATE TABLE IF NOT EXISTS editions (
     UNIQUE (doc_id, edition_no)
 );
 
+-- 整理者对「工作版对应组」的判读意见（每组至多一条；group_id 为空=对应组消失 / 无法唯一对应后的待复核孤儿）
+CREATE TABLE IF NOT EXISTS group_judgments (
+    id              BIGSERIAL PRIMARY KEY,
+    doc_id          BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    group_id        BIGINT REFERENCES grp(id) ON DELETE SET NULL,
+    chosen_ms_id    BIGINT REFERENCES manuscripts(id) ON DELETE SET NULL,  -- 已裁定：所选抄本；未裁定为空
+    chosen_line_id  BIGINT REFERENCES lines(id) ON DELETE CASCADE,        -- 所选有效片段所在行（未裁定为空）
+    decided         BOOLEAN NOT NULL,                 -- TRUE=已裁定（选定一份抄本）；FALSE=明确标为未裁定
+    reason          TEXT NOT NULL DEFAULT '',         -- 理由（已裁定必填，未裁定可空）
+    quote_text      TEXT NOT NULL DEFAULT '',         -- 已裁定：引用文字（裁定当时的片段文字）
+    -- 组锚点（底本片段身份）：底本抄本 + 该抄本原始行号 + 码点左闭右开 + 底本片段文字
+    base_ms_id      BIGINT,
+    base_line_no    INTEGER,
+    base_start_cp   INTEGER,
+    base_end_cp     INTEGER,
+    base_text       TEXT NOT NULL DEFAULT '',
+    -- 已裁定的所选片段锚点：原始行号 + 码点区间（随行文平移，对账时刷新；行界变化后仅可追溯）
+    chosen_line_no  INTEGER,
+    chosen_start_cp INTEGER,
+    chosen_end_cp   INTEGER,
+    needs_review    BOOLEAN NOT NULL DEFAULT FALSE,   -- 待复核闩锁：一旦置 TRUE，只能由人重新确认 / 撤回清除
+    review_reason   TEXT NOT NULL DEFAULT '',         -- 待复核原因（中文，可定位）
+    frozen          BOOLEAN NOT NULL DEFAULT FALSE,   -- TRUE=由恢复已发布版带回的固化意见
+    last_ord        INTEGER,                          -- 最近一次挂载的组序号（孤儿意见的追溯信息）
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 每个对应组至多一条意见（孤儿意见 group_id 为空，不受此约束限制）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_judgment_group
+    ON group_judgments(group_id) WHERE group_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_judgments_doc ON group_judgments(doc_id);
+
 CREATE INDEX IF NOT EXISTS idx_manuscripts_doc ON manuscripts(doc_id);
 CREATE INDEX IF NOT EXISTS idx_lines_ms ON lines(ms_id);
 CREATE INDEX IF NOT EXISTS idx_grp_doc ON grp(doc_id);

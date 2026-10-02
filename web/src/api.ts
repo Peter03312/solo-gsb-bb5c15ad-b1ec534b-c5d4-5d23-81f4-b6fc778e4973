@@ -111,6 +111,30 @@ export const api = {
   exportArchive: (id: number) => req<CollationArchive>('GET', `/api/documents/${id}/archive`),
   importArchive: (archive: unknown) =>
     req<ImportArchiveResult>('POST', '/api/documents/import', archive),
+  // 判读意见
+  putJudgment: (
+    id: number,
+    groupId: number,
+    expectedVersion: number,
+    body: { decided: boolean; chosenMsId?: number | null; reason?: string }
+  ) => req<JudgmentWriteResult>(
+    'PUT',
+    `/api/documents/${id}/groups/${groupId}/judgment`,
+    { expectedVersion, ...body }
+  ),
+  reconfirmJudgment: (
+    id: number,
+    judgmentId: number,
+    expectedVersion: number,
+    attachGroupId?: number | null
+  ) =>
+    req<JudgmentReconfirmResult>(
+      'POST',
+      `/api/documents/${id}/judgments/${judgmentId}/reconfirm`,
+      { expectedVersion, ...(attachGroupId != null ? { attachGroupId } : {}) }
+    ),
+  withdrawJudgment: (id: number, judgmentId: number, expectedVersion: number) =>
+    req('DELETE', `/api/documents/${id}/judgments/${judgmentId}`, { expectedVersion }),
 };
 
 import type {
@@ -123,6 +147,8 @@ import type {
   EditionDiff,
   EditionSummary,
   ImportArchiveResult,
+  JudgmentReconfirmResult,
+  JudgmentWriteResult,
   ReLineBasis,
   ReLinePreview,
   ReLineResult,

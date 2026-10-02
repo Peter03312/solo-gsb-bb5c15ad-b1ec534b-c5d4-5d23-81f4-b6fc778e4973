@@ -276,6 +276,86 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 `brokenGroups[]`（`groupId/ord/newlyBroken/reason`）。
 提交成功返回 `{ ok, version, result }`（`result` 与预览同构，新行 id 已回填）。
 
+### 判读意见（整理者对工作版对应组的判读；每组至多一条）
+整理者可对**工作版的每个对应组**给出判读意见（工作区「校勘对照」页每组“判定”列，也可直接调 HTTP API）：
+
+- **两种意见**：
+  - **已裁定**：选定该组一份**有有效片段**的抄本为依据（缺文 / 越界 / 待修复组不可选），必填**理由**；
+    **引用文字由服务端从当前片段固化**（不信任客户端提交的文字）；
+  - **明确标为未裁定**：理由可空。**每组至多一条**，重复写入即覆盖；也可撤回恢复为“无意见”。
+- **页面与 HTTP API 同构展示**：校勘对照页与 `GET /api/documents/:id` 均在每组给出
+  `judgment`（`status=confirmed/undecided/review`、理由 `reason`、引用文字 `quoteText`、
+  所选抄本 `chosenMsName`、底本锚点等）；文献级 `stats` 给出三类意见计数；
+  失去组归属的意见集中列在 `orphanJudgments[]`。
+- **有效性随行文 / 底本 / 归组变化自动对账**，仅当**原组与所选片段都能唯一对应且引用文字未变**时，
+  已裁定意见才继续有效：
+  - **行内改字 / 批量行改 / 行界拆分合并**：片段保留身份，插入在**边界**时随累计位移平移、锚点刷新，
+    意见继续有效；改动与片段**相交**、插入点**严格位于片段内部**、缩短**越界**、跨拆分点 → 组待修复、意见转**待复核**；
+  - **切换底本**：含新底本有效片段的完好组，底本锚点切到新底本后意见继续有效（不静默改变所选抄本 / 引用）；
+    缺新底本片段的组待复核；
+  - **整批重存对应组**（更换全部组 id）：按与「版本对照」完全相同的
+    **底本片段位置（抄本 + 原始行号 + 码点区间）唯一配对**重新挂载；旧侧 / 新侧位置不唯一、
+    底本或引用文字已变 → 意见成为**待复核孤儿**，**绝不静默移到别组**；
+  - **删除对应组**：该组意见立即成为待复核孤儿（保留最近组序号与原引用文字供追溯）。
+- **待复核闩锁只增不减**：一旦待复核，修复组 / 后续编辑都**不会自动转好**；
+  必须由整理者**重新确认**（服务端在当前工作版重新核对组完好、所选片段有效、引用文字与存储一致）
+  或**撤回**。**待复核意见（含孤儿、含未裁定）未重新确认 / 撤回前不得发布新校勘版**；
+  **未裁定意见本身可发布**。
+- **发布固化、恢复同步**：发布快照固化当时全部意见；**旧版阅读不受后续编辑影响**
+  （旧版页只读展示该版意见）；**恢复该版时同步恢复其意见**并挂到重建后的组（标记 `frozen`，
+  重新确认后转为普通工作版意见）。
+- **归档迁移**：归档含工作版意见（`judgments[]`）与各版快照中的意见；导入重建抄本 / 组标识后，
+  意见按底本位置唯一配对到**新文献的抄本和组**，不能唯一配对的保留为待复核孤儿；
+  **旧格式归档（无 judgments 节）仍可正常导入**。
+- **并发控制**：所有写入须携带工作版 `expectedVersion`；版本过期、非法选择（缺文 / 越界 /
+  抄本不属于本文献 / 已裁定缺理由）、或无法确认的意见 → **409 / 400 整次拒绝且不改动数据**；
+  每次成功写入只推进一次文献版本。
+
+接口（由实现方给出的调用示例）：
+
+```bash
+# 下“已裁定”意见：选定组内一份有有效片段的抄本 + 理由；引用文字由服务端固化并返回
+curl -X PUT http://localhost:4000/api/documents/1/groups/11/judgment \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedVersion": 7, "decided": true, "chosenMsId": 2, "reason": "乙本异文于义为长" }'
+# → { "ok": true, "version": 8, "decided": true, "quoteText": "天命之謂姓" }
+
+# 明确标为未裁定（理由可空；可发布）
+curl -X PUT http://localhost:4000/api/documents/1/groups/12/judgment \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedVersion": 8, "decided": false, "reason": "异文疑未能定，暂存" }'
+
+# 待复核后重新确认（孤儿意见可带 attachGroupId 指定重挂的当前组；不带则按锚点自动唯一配对）
+curl -X POST http://localhost:4000/api/documents/1/judgments/5/reconfirm \
+  -H 'Content-Type: application/json' \
+  -d '{ "expectedVersion": 13 }'
+# 无法在当前工作版确认（引用已变 / 对应不唯一 / 组待修复）→ 409 details.code=JUDGMENT_RECHECK_FAILED
+
+# 撤回意见（含待复核孤儿；撤回后该组恢复“无意见”，可重新判读）
+curl -X DELETE http://localhost:4000/api/documents/1/judgments/5 \
+  -H 'Content-Type: application/json' -d '{ "expectedVersion": 13 }'
+```
+
+`GET /api/documents/:id` 每组返回（节选）：
+
+```json
+{
+  "id": 11, "ord": 1, "broken": false, "baseText": "天命之謂性", "cells": [ /* … */ ],
+  "judgment": {
+    "id": 5, "status": "confirmed", "decided": true,
+    "reason": "乙本异文于义为长", "quoteText": "天命之謂姓",
+    "needsReview": false, "reviewReason": null, "frozen": false,
+    "chosenMsId": 2, "chosenMsName": "乙本", "chosenLineNo": 1, "chosenStartCp": 0, "chosenEndCp": 5,
+    "baseMsId": 1, "baseMsName": "甲本", "baseLineNo": 1, "baseStartCp": 0, "baseEndCp": 5,
+    "baseText": "天命之謂性", "createdAt": "…", "updatedAt": "…"
+  }
+}
+```
+
+待复核时 `status="review"、needsReview=true、reviewReason="第 N 组…：请重新确认或撤回"`，
+引用文字 `quoteText` 仍原样展示；孤儿意见位于顶层 `orphanJudgments[]`（含 `lastOrd`）。
+发布时若存在待复核意见 → **409** `details.code=PUBLISH_WITH_PENDING_REVIEW`。
+
 ### 发布与旧版
 - 发布生成 **不可变快照**（JSONB，固化发布定稿时的版本号）。发布后继续修改只影响工作版，
   **旧发布版始终可阅读**（“发布与旧版”页签 → 阅读此版）。
@@ -311,9 +391,10 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 整理者在“发布与旧版”中选取一个**已发布校勘版**，点“与当前工作版对照”查看差异后，
 在版本对照页点 **“确认恢复”**（也可直接调 HTTP API）：
 
-- **恢复范围**：该版快照中的**抄本及顺序、底本、全部原始行、对应组片段与缺文标记**，
+- **恢复范围**：该版快照中的**抄本及顺序、底本、全部原始行、对应组片段与缺文标记、判读意见**，
   被整体重建为该版定稿状态——发布后新增的抄本/行/组被移除，删除/改动的内容复原，
-  整批重存后的组按快照重放。**文献标题、已发布版编号（`published_ver`）和全部快照
+  整批重存后的组按快照重放，**判读意见按底本位置挂回重建后的组（随版冻结，重新确认后转为工作版意见）**。
+  **文献标题、已发布版编号（`published_ver`）和全部快照
   （含目标版自身）保持原样**，旧版仍可阅读、对照。
 - **有效标识**：重建后的**行与组取得当前有效标识**（全新 id；不沿用快照中的旧行/旧组 id）；
   抄本沿用其跨版本的稳定身份 id（快照中缺失的抄本按原 id 补回，序列自动推进）。
@@ -349,7 +430,8 @@ curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
   "version": 13,
   "restored": {
     "manuscriptCount": 3, "lineCount": 6, "groupCount": 4,
-    "fragmentCount": 10, "missingCount": 2, "baseMsId": 7
+    "fragmentCount": 10, "missingCount": 2, "baseMsId": 7,
+    "judgmentCount": 4
   }
 }
 ```
@@ -365,7 +447,9 @@ curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
   - **抄本及顺序**、全部**原始行**（含行序与文字）；
   - **当前对应组**（组序、**待修复状态**、各抄本片段坐标与**缺文标记**；
     待修复组的越界坐标原样保留）；
-  - **全部已发布版快照**（编号、发布时间、快照本体）。
+  - **工作版判读意见**（`judgments[]`：已裁定 / 未裁定、理由与引用文字、底本与所选片段锚点、
+    待复核状态与孤儿的最近组序号；旧格式归档无此节，导入时按无意见处理）；
+  - **全部已发布版快照**（编号、发布时间、快照本体，快照内亦含该版固化意见）。
   归档内的 id 均为「归档局部引用」（导出时取源库 id），导入时全部重建，与任何现存文献互不干扰。
 - **导入（单次事务，先校验后写入，任一处不合法即整次回滚、不创建任何文献）**：
   - **未知格式 / 格式版本不符** → 400 拒绝；
@@ -379,7 +463,9 @@ curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
     （section / 发布版号 / 组序 / 抄本名 / 行号），整次拒绝。
 - **重建内部标识及关联**：新文献的文献 / 抄本 / 行 / 组 / 片段全部取得新 id；
   快照内的抄本引用同步重建为新标识（历史快照独有、工作版已删除的抄本为其保留全新空闲标识，
-  恢复该版时可物化而不与任何文献冲突）。工作版版本号与已发布版序号按归档落库。
+  恢复该版时可物化而不与任何文献冲突）。**判读意见的抄本 / 组引用同步重建**：
+  按底本片段位置唯一配对到新文献的抄本与组，引用文字仍须一致，不能唯一配对的保留为待复核孤儿。
+  工作版版本号与已发布版序号按归档落库。
 - **导入成功不改动源文献**；新文献的旧版仍可**阅读、对照、恢复**，工作版仍可编辑、
   修复、行界调整、补配并按现有门禁**继续编号发布**；**同一文件重复导入各自创建独立文献**。
 - 工作区「归档」页签展示导入结果（新文献编号与各项计数，可一键打开新文献）及逐条错误原因。
@@ -408,7 +494,7 @@ curl -X POST http://localhost:4000/api/documents/import \
   "imported": {
     "manuscriptCount": 3, "lineCount": 6, "groupCount": 4,
     "brokenGroupCount": 1, "fragmentCount": 10, "missingCount": 2,
-    "editionCount": 2
+    "judgmentCount": 3, "judgmentReviewCount": 0, "editionCount": 2
   }
 }
 ```
@@ -449,9 +535,12 @@ curl -X POST http://localhost:4000/api/documents/import \
 | PUT | `/api/lines/:lineId` | 行内改字（`startCp/endCp/replacement`） |
 | POST | `/api/documents/:id/lines/batch-edit/preview` | **批量行改预览**（只读）：多抄本多行多处编辑，返回各行新文字/片段新位置/受影响组 |
 | POST | `/api/documents/:id/lines/batch-edit` | **确认批量行改**（携带 `basis`；区间重叠/同点插入/插入点落他区间含端点/跨文献行 400 定位；过期 409、basis 不符 409 `BATCH_EDIT_STALE`，成功只推进一次） |
-| PUT | `/api/documents/:id/groups` | 整批保存对应组（替换式，全量校验） |
-| PUT | `/api/documents/:id/groups/:gid/repair` | 修复单个对应组 |
-| DELETE | `/api/documents/:id/groups/:gid` | 删除对应组 |
+| PUT | `/api/documents/:id/groups` | 整批保存对应组（替换式，全量校验；判读意见按底本位置唯一配对重挂，不唯一则待复核孤儿） |
+| PUT | `/api/documents/:id/groups/:gid/repair` | 修复单个对应组（不清意见待复核闩锁） |
+| DELETE | `/api/documents/:id/groups/:gid` | 删除对应组（其判读意见转为待复核孤儿） |
+| PUT | `/api/documents/:id/groups/:gid/judgment` | **写入 / 修改判读意见**（已裁定须 chosenMsId + 理由，引用文字服务端固化；或 decided=false 未裁定；非法选择 400、待修复组 409、过期 409，整次拒绝不改数据） |
+| POST | `/api/documents/:id/judgments/:jid/reconfirm` | **重新确认待复核意见**（孤儿可带 attachGroupId；无法确认 409 `JUDGMENT_RECHECK_FAILED`） |
+| DELETE | `/api/documents/:id/judgments/:jid` | **撤回判读意见**（携带 expectedVersion） |
 | GET | `/api/documents/:id/supplement/preview?targetMsId=` | **补配预览**（只读）：目标抄本空闲区间内的同文候选 |
 | POST | `/api/documents/:id/supplement` | **提交补配**（整批重核；过期 409 / 候选失效 409 不推进） |
 | GET | `/api/documents/:id/reline/preview?op=…` | **行界调整预览**（只读）：拆分 `op=split&lineId=&splitCp=`；合并 `op=merge&leftLineId=&rightLineId=` |
@@ -512,7 +601,16 @@ INSERTION_POINT_IN_INTERVAL/LINE_NOT_IN_DOC/BAD_SHAPE）、非零长编辑端点
 导入不改动源文献、空组列表与缺底本待修复组可导入、
 未知格式/格式版本/非对象/元信息缺失/底本引用缺失/抄本重名/顺序不连续/行引用缺失/行号不连续/
 片段悬空引用（抄本/行/他抄本的行）/待修复组负值/逆序/零长度/完好组越界/重叠/缺底本/
-空组/组序重复缺号/发布版编号缺号/publishedVer 不符/快照损坏逐条定位（ARCHIVE_INVALID）并整次拒绝不创建文献**。
+空组/组序重复缺号/发布版编号缺号/publishedVer 不符/快照损坏逐条定位（ARCHIVE_INVALID）并整次拒绝不创建文献**，以及
+**判读意见：每组至多一条、已裁定须选有有效片段抄本且理由必填（缺文/越界/待修复/他文献抄本不可选）、
+引用文字服务端固化、未裁定可空理由可发布、页面与 API 同构展示意见/引用/待复核及统计与孤儿列表、
+行内改字（相交/内部插入/越界 → 待复核，边界插入随平移锚点刷新保持有效）、批量行改与行界调整同样对账、
+切底本后含新底本片段组意见随新底本锚点继续有效而缺片段组待复核、
+整批重存按底本位置唯一配对重挂且不唯一/引用已变/已待复核成孤儿不静默移组、
+删组成待复核孤儿、修复不清闩锁须人重新确认或撤回、重新确认成功（引用未变刷新锚点）与失败 409 不改数据、
+撤回、待复核（含未裁定与孤儿）阻断发布 PUBLISH_WITH_PENDING_REVIEW、发布固化意见旧版只读不受后续编辑影响、
+恢复该版同步恢复意见并冻结挂到重建组、归档导出含意见且导入按新文献抄本组唯一配对挂载、旧格式无 judgments 归档仍可导入、
+缺 expectedVersion 400、过期 409 整次拒绝不改动数据**。
 
 ---
 

@@ -1207,7 +1207,7 @@ async function main() {
         assert.strictEqual(r.json.version, xVerBeforeRestore + 1, '成功后版本号只前进一次');
         assert.deepStrictEqual(r.json.restored, {
             manuscriptCount: 2, lineCount: 4, groupCount: 2, fragmentCount: 4, missingCount: 1,
-            baseMsId: xA0.id,
+            baseMsId: xA0.id, judgmentCount: 0,
         });
         xView = (await call(base, 'GET', `/documents/${dX}`)).json;
         const xVerAfterRestore = xView.document.version;
@@ -1803,6 +1803,7 @@ async function main() {
         assert.deepStrictEqual(r.json.imported, {
             manuscriptCount: 3, lineCount: 6, groupCount: 3,
             brokenGroupCount: 2, fragmentCount: 9, missingCount: 1, editionCount: 1,
+            judgmentCount: 0, judgmentReviewCount: 0,
         });
         let impView = (await call(base, 'GET', `/documents/${dImp}`)).json;
         assert.strictEqual(impView.document.version, arcVersion);
@@ -1989,6 +1990,442 @@ async function main() {
         // 全部拒绝后源文献依旧不变
         arcView = (await call(base, 'GET', `/documents/${dArc}`)).json;
         assert.strictEqual(arcView.document.version, arcVersion, '失败导入不触及源文献');
+        // ================================================================== //
+        // ---------- 判读意见（整理者对工作版对应组的判读） ---------- //
+        // ================================================================== //
+        {
+            // 新建独立文献：甲（底）/ 乙 / 丙
+            r = await call(base, 'POST', '/documents', { title: `判读意见 ${++seq}`, manuscripts: ['甲本', '乙本', '丙本'] });
+            assert.strictEqual(r.status, 201);
+            const dJ = r.json.id;
+            let jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            const jA = jv.manuscripts[0], jB = jv.manuscripts[1], jC = jv.manuscripts[2];
+            let jver = jv.document.version;
+            // 甲: 行1 天命之謂性率性之謂道；乙: 行1 天命之謂姓率性之謂道；丙: 行1 天命之謂性
+            await call(base, 'POST', `/manuscripts/${jA.id}/lines`, { expectedVersion: jver++, content: '天命之謂性率性之謂道' });
+            await call(base, 'POST', `/manuscripts/${jB.id}/lines`, { expectedVersion: jver++, content: '天命之謂姓率性之謂道' });
+            await call(base, 'POST', `/manuscripts/${jC.id}/lines`, { expectedVersion: jver++, content: '天命之謂性' });
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            const ja1 = jv.rawByMs.find((x) => x.msId === jA.id).lines[0].lineId;
+            const jb1 = jv.rawByMs.find((x) => x.msId === jB.id).lines[0].lineId;
+            const jc1 = jv.rawByMs.find((x) => x.msId === jC.id).lines[0].lineId;
+            // 两组：组1「天命之謂性/姓/性」，组2「率性之謂道/率性之謂道/缺」
+            const jGroups = [
+                { ord: 1, fragments: [
+                        { msId: jA.id, lineId: ja1, startCp: 0, endCp: 5 },
+                        { msId: jB.id, lineId: jb1, startCp: 0, endCp: 5 },
+                        { msId: jC.id, lineId: jc1, startCp: 0, endCp: 5 },
+                    ] },
+                { ord: 2, fragments: [
+                        { msId: jA.id, lineId: ja1, startCp: 5, endCp: 10 },
+                        { msId: jB.id, lineId: jb1, startCp: 5, endCp: 10 },
+                        { msId: jC.id, missing: true },
+                    ] },
+            ];
+            r = await call(base, 'PUT', `/documents/${dJ}/groups`, { expectedVersion: jv.document.version, groups: jGroups });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            jver = jv.document.version;
+            const jg1 = jv.groups[0].id, jg2 = jv.groups[1].id;
+            // 初始：无意见、无统计
+            assert.strictEqual(jv.groups[0].judgment, null);
+            assert.deepStrictEqual([jv.stats.judgmentConfirmedCount, jv.stats.judgmentUndecidedCount, jv.stats.judgmentReviewCount], [0, 0, 0]);
+            // 已裁定：选乙本（异文「姓」），引用文字由服务端固化
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg1}/judgment`, {
+                expectedVersion: jver, decided: true, chosenMsId: jB.id, reason: '乙本异文为是',
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            assert.strictEqual(r.json.decided, true);
+            assert.strictEqual(r.json.quoteText, '天命之謂姓');
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            const j1 = jv.groups[0].judgment;
+            assert.strictEqual(j1.status, 'confirmed');
+            assert.strictEqual(j1.quoteText, '天命之謂姓');
+            assert.strictEqual(j1.chosenMsId, jB.id);
+            assert.strictEqual(j1.chosenMsName, '乙本');
+            assert.strictEqual(j1.baseText, '天命之謂性');
+            assert.deepStrictEqual([j1.baseLineNo, j1.baseStartCp, j1.baseEndCp], [1, 0, 5]);
+            assert.strictEqual(jv.stats.judgmentConfirmedCount, 1);
+            jver = jv.document.version;
+            // 组2 明确未裁定（理由可空）
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg2}/judgment`, {
+                expectedVersion: jver, decided: false,
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[1].judgment.status, 'undecided');
+            assert.strictEqual(jv.stats.judgmentUndecidedCount, 1);
+            jver = jv.document.version;
+            // 非法选择：已裁定缺理由 → 400
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg1}/judgment`, {
+                expectedVersion: jver, decided: true, chosenMsId: jB.id, reason: '   ',
+            });
+            assert.strictEqual(r.status, 400, JSON.stringify(r.json));
+            // 非法选择：选缺文的抄本（丙在组2缺文）→ 400
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg2}/judgment`, {
+                expectedVersion: jver, decided: true, chosenMsId: jC.id, reason: '丙本此处缺文不能选',
+            });
+            await expectFail(r, 400, '缺文');
+            // 非法选择：抄本不属于本文献 → 400
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg1}/judgment`, {
+                expectedVersion: jver, decided: true, chosenMsId: 999999, reason: 'x',
+            });
+            assert.strictEqual(r.status, 400);
+            // 过期版本 → 409，整次拒绝不改动
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg1}/judgment`, {
+                expectedVersion: 1, decided: false,
+            });
+            await expectFail(r, 409, '版本已过期');
+            // 组不存在 → 404
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/999999/judgment`, {
+                expectedVersion: jver, decided: false,
+            });
+            assert.strictEqual(r.status, 404);
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].judgment.status, 'confirmed', '失败的写入不得改动既有意见');
+            // ---------- 行文变化：引用文字已变 → 待复核（不静默改好） ----------
+            // 乙本行1把「姓」改为「性」（[4,5)），与组1相交 → 组1待修复，意见待复核
+            r = await call(base, 'PUT', `/lines/${jb1}`, { expectedVersion: jver, startCp: 4, endCp: 5, replacement: '性' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].broken, true);
+            assert.strictEqual(jv.groups[0].judgment.status, 'review');
+            assert.ok(jv.groups[0].judgment.reviewReason.includes('待修复') || jv.groups[0].judgment.reviewReason.includes('引用'));
+            assert.strictEqual(jv.groups[0].judgment.quoteText, '天命之謂姓', '待复核时引用文字原样保留展示');
+            assert.strictEqual(jv.stats.judgmentReviewCount, 1);
+            assert.strictEqual(jv.stats.judgmentConfirmedCount, 0);
+            jver = jv.document.version;
+            // 待修复组与待复核意见同时存在 → 发布被拦（组待修复门禁先触发；修复组后意见闩锁仍拦）
+            r = await call(base, 'POST', `/documents/${dJ}/publish`, { expectedVersion: jver });
+            await expectFail(r, 409, '不得发布');
+            // 修复组1（乙改后与甲一致）
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg1}/repair`, {
+                expectedVersion: jver,
+                group: { ord: 1, fragments: [
+                        { msId: jA.id, lineId: ja1, startCp: 0, endCp: 5 },
+                        { msId: jB.id, lineId: jb1, startCp: 0, endCp: 5 },
+                        { msId: jC.id, lineId: jc1, startCp: 0, endCp: 5 },
+                    ] },
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].broken, false);
+            assert.strictEqual(jv.groups[0].judgment.status, 'review', '修复不清待复核闩锁，须人重新确认 / 撤回');
+            jver = jv.document.version;
+            const j1id = jv.groups[0].judgment.id;
+            // 组已修复但意见仍待复核 → 意见门禁单独拦截发布
+            r = await call(base, 'POST', `/documents/${dJ}/publish`, { expectedVersion: jver });
+            await expectFail(r, 409, '判读意见待复核');
+            assert.strictEqual(r.json.details.code, 'PUBLISH_WITH_PENDING_REVIEW');
+            // 当前引用文字已变为「天命之謂性」，与存储「天命之謂姓」不符 → 重新确认失败 409
+            r = await call(base, 'POST', `/documents/${dJ}/judgments/${j1id}/reconfirm`, { expectedVersion: jver });
+            await expectFail(r, 409, '重新确认');
+            assert.strictEqual(r.json.details.code, 'JUDGMENT_RECHECK_FAILED');
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].judgment.status, 'review', '确认失败不改动');
+            jver = jv.document.version;
+            // 撤回该意见 → 组恢复无意见，可重新判读；撤回推进版本
+            r = await call(base, 'DELETE', `/documents/${dJ}/judgments/${j1id}`, { expectedVersion: jver });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].judgment, null);
+            assert.strictEqual(jv.stats.judgmentReviewCount, 0);
+            jver = jv.document.version;
+            // 重新下已裁定意见（改后甲乙同文，选甲本底本片段作为依据）
+            r = await call(base, 'PUT', `/documents/${dJ}/groups/${jg1}/judgment`, {
+                expectedVersion: jver, decided: true, chosenMsId: jA.id, reason: '改后从甲本',
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            assert.strictEqual(r.json.quoteText, '天命之謂性');
+            // ---------- 引用仍有效的场景：端点相接插入只平移片段，意见继续有效 ----------
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            jver = jv.document.version;
+            // 在甲本行1组2片段起点（第5字）处插入字：组2区间 [5,10) 端点相接，平移到 [6,11)
+            r = await call(base, 'PUT', `/lines/${ja1}`, { expectedVersion: jver, startCp: 5, endCp: 5, replacement: 'X' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            // 组2未裁定意见仍有效（组完好、锚点随平移刷新）
+            const g2after = jv.groups.find((g) => g.ord === 2);
+            assert.strictEqual(g2after.judgment.status, 'undecided');
+            jver = jv.document.version;
+            // 撤销插入
+            r = await call(base, 'PUT', `/lines/${ja1}`, { expectedVersion: jver, startCp: 5, endCp: 6, replacement: '' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            // ---------- 删除组 → 意见成待复核孤儿（不静默移到别组） ----------
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            jver = jv.document.version;
+            const g2id = jv.groups.find((g) => g.ord === 2).id;
+            r = await call(base, 'DELETE', `/documents/${dJ}/groups/${g2id}`, { expectedVersion: jver });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.orphanJudgments.length, 1);
+            const orphan = jv.orphanJudgments[0];
+            assert.strictEqual(orphan.status, 'review');
+            assert.strictEqual(orphan.lastOrd, 2);
+            assert.strictEqual(orphan.decided, false);
+            assert.ok(orphan.reviewReason.includes('已删除'));
+            jver = jv.document.version;
+            // 孤儿意见阻断发布
+            r = await call(base, 'POST', `/documents/${dJ}/publish`, { expectedVersion: jver });
+            await expectFail(r, 409, '待复核');
+            // 撤回孤儿 → 可发布
+            r = await call(base, 'DELETE', `/documents/${dJ}/judgments/${orphan.id}`, { expectedVersion: jver });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            jver = jv.document.version;
+            assert.strictEqual(jv.orphanJudgments.length, 0);
+            // ---------- 发布固化意见，旧版阅读不受后续编辑影响，恢复同步恢复意见 ----------
+            r = await call(base, 'POST', `/documents/${dJ}/publish`, { expectedVersion: jver });
+            assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+            const jEdNo = r.json.editionNo;
+            // 发布后改乙本行（与组1相交）→ 意见待复核（工作版），但旧版快照仍是已裁定
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            jver = jv.document.version;
+            r = await call(base, 'PUT', `/lines/${jb1}`, { expectedVersion: jver, startCp: 4, endCp: 5, replacement: '姓' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].judgment.status, 'review', '工作版意见待复核');
+            const frozen = (await call(base, 'GET', `/documents/${dJ}/editions/${jEdNo}`)).json;
+            const frozenJ = frozen.view.groups[0].judgment;
+            assert.strictEqual(frozenJ.status, 'confirmed', '发布版固化当时已裁定意见');
+            assert.strictEqual(frozenJ.quoteText, '天命之謂性');
+            assert.strictEqual(frozen.view.stats.judgmentConfirmedCount, 1);
+            assert.strictEqual(frozen.view.orphanJudgments.length, 0);
+            // 恢复该版 → 意见同步恢复（冻结），并挂到重建后的组
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            const jverBefore = jv.document.version;
+            r = await call(base, 'POST', `/documents/${dJ}/editions/${jEdNo}/restore`, { expectedVersion: jverBefore });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            assert.ok(r.json.restored.judgmentCount >= 1, '恢复结果给出意见计数');
+            jv = (await call(base, 'GET', `/documents/${dJ}`)).json;
+            assert.strictEqual(jv.groups[0].judgment.status, 'confirmed', '恢复后意见随版带回');
+            assert.strictEqual(jv.groups[0].judgment.frozen, true);
+            assert.strictEqual(jv.groups[0].judgment.quoteText, '天命之謂性');
+            assert.strictEqual(jv.stats.judgmentReviewCount, 0, '该版发布时无待复核意见');
+        }
+        // ---------- 判读意见：整批重存后的唯一配对 / 不唯一不静默迁移 ----------
+        {
+            r = await call(base, 'POST', '/documents', { title: `意见归组 ${++seq}`, manuscripts: ['甲本', '乙本'] });
+            assert.strictEqual(r.status, 201);
+            const dK = r.json.id;
+            let kv = (await call(base, 'GET', `/documents/${dK}`)).json;
+            const kA = kv.manuscripts[0], kB = kv.manuscripts[1];
+            let kver = kv.document.version;
+            await call(base, 'POST', `/manuscripts/${kA.id}/lines`, { expectedVersion: kver++, content: 'ABAB' });
+            await call(base, 'POST', `/manuscripts/${kB.id}/lines`, { expectedVersion: kver++, content: 'ABAB' });
+            kv = (await call(base, 'GET', `/documents/${dK}`)).json;
+            const ka1 = kv.rawByMs.find((x) => x.msId === kA.id).lines[0].lineId;
+            const kb1 = kv.rawByMs.find((x) => x.msId === kB.id).lines[0].lineId;
+            // 组1=[0,2)「AB」，组2=[2,4)「AB」——两处底本文字相同
+            const kGroups = [
+                { ord: 1, fragments: [
+                        { msId: kA.id, lineId: ka1, startCp: 0, endCp: 2 },
+                        { msId: kB.id, lineId: kb1, startCp: 0, endCp: 2 },
+                    ] },
+                { ord: 2, fragments: [
+                        { msId: kA.id, lineId: ka1, startCp: 2, endCp: 4 },
+                        { msId: kB.id, lineId: kb1, startCp: 2, endCp: 4 },
+                    ] },
+            ];
+            r = await call(base, 'PUT', `/documents/${dK}/groups`, { expectedVersion: kv.document.version, groups: kGroups });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            kv = (await call(base, 'GET', `/documents/${dK}`)).json;
+            const kg1 = kv.groups[0].id;
+            // 对组1下已裁定意见（引用「AB」）
+            r = await call(base, 'PUT', `/documents/${dK}/groups/${kg1}/judgment`, {
+                expectedVersion: kv.document.version, decided: true, chosenMsId: kB.id, reason: '同文从乙',
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            // 同构整批重存（组 id 全换，位置不变）→ 底本位置 [0,2) 在新侧唯一 → 意见自动挂回同位置组
+            kv = (await call(base, 'GET', `/documents/${dK}`)).json;
+            r = await call(base, 'PUT', `/documents/${dK}/groups`, { expectedVersion: kv.document.version, groups: kGroups });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            kv = (await call(base, 'GET', `/documents/${dK}`)).json;
+            const newGAt0 = kv.groups.find((g) => g.ord === 1);
+            assert.strictEqual(newGAt0.judgment.status, 'confirmed', '位置唯一且引用未变，意见继续有效');
+            assert.strictEqual(newGAt0.judgment.quoteText, 'AB');
+            assert.strictEqual(kv.orphanJudgments.length, 0);
+            // 改变归组：让 [0,2) 在底本中不再唯一——构造两组都落在 [0,2) 不允许重叠，
+            // 故用“位置移动”令原锚点 [0,2) 在新侧出现 0 次（整体右移一组）：
+            // 新组：[0,1)「A」、[1,3)「BA」、[3,4)「B」
+            const shifted = [
+                { ord: 1, fragments: [
+                        { msId: kA.id, lineId: ka1, startCp: 0, endCp: 1 },
+                        { msId: kB.id, lineId: kb1, startCp: 0, endCp: 1 },
+                    ] },
+                { ord: 2, fragments: [
+                        { msId: kA.id, lineId: ka1, startCp: 1, endCp: 3 },
+                        { msId: kB.id, lineId: kb1, startCp: 1, endCp: 3 },
+                    ] },
+                { ord: 3, fragments: [
+                        { msId: kA.id, lineId: ka1, startCp: 3, endCp: 4 },
+                        { msId: kB.id, lineId: kb1, startCp: 3, endCp: 4 },
+                    ] },
+            ];
+            r = await call(base, 'PUT', `/documents/${dK}/groups`, { expectedVersion: kv.document.version, groups: shifted });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            kv = (await call(base, 'GET', `/documents/${dK}`)).json;
+            assert.strictEqual(kv.orphanJudgments.length, 1, '原锚点位置消失 → 孤儿待复核');
+            assert.strictEqual(kv.orphanJudgments[0].status, 'review');
+            assert.strictEqual(kv.stats.judgmentReviewCount, 1);
+            for (const g of kv.groups)
+                assert.strictEqual(g.judgment, null, '意见不得静默挂到任何新组');
+            // 整批重存不推进额外版本以外的语义：过期版本拒绝
+            r = await call(base, 'PUT', `/documents/${dK}/groups`, { expectedVersion: 1, groups: shifted });
+            await expectFail(r, 409, '版本已过期');
+        }
+        // ---------- 判读意见：切底本 / 引用随平移保持有效 / 待复核后重新确认成功 ----------
+        {
+            r = await call(base, 'POST', '/documents', { title: `意见底本 ${++seq}`, manuscripts: ['甲本', '乙本'] });
+            assert.strictEqual(r.status, 201);
+            const dM = r.json.id;
+            let mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            const mA = mv.manuscripts[0], mB = mv.manuscripts[1];
+            let mver = mv.document.version;
+            await call(base, 'POST', `/manuscripts/${mA.id}/lines`, { expectedVersion: mver++, content: '天命之謂道' });
+            await call(base, 'POST', `/manuscripts/${mB.id}/lines`, { expectedVersion: mver++, content: '天命之謂道' });
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            const ma1 = mv.rawByMs.find((x) => x.msId === mA.id).lines[0].lineId;
+            const mb1 = mv.rawByMs.find((x) => x.msId === mB.id).lines[0].lineId;
+            const mGroups = [
+                { ord: 1, fragments: [
+                        { msId: mA.id, lineId: ma1, startCp: 0, endCp: 5 },
+                        { msId: mB.id, lineId: mb1, startCp: 0, endCp: 5 },
+                    ] },
+            ];
+            r = await call(base, 'PUT', `/documents/${dM}/groups`, { expectedVersion: mv.document.version, groups: mGroups });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            const mg1 = mv.groups[0].id;
+            // 已裁定选乙本
+            r = await call(base, 'PUT', `/documents/${dM}/groups/${mg1}/judgment`, {
+                expectedVersion: mv.document.version, decided: true, chosenMsId: mB.id, reason: '乙为底据',
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            // 切底本到乙：组含乙真实片段、完好 → 意见底本锚点切到乙，仍有效
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            r = await call(base, 'PUT', `/documents/${dM}/base`, { expectedVersion: mv.document.version, msId: mB.id });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            assert.strictEqual(mv.groups[0].judgment.status, 'confirmed', '切底本后含新底本片段的完好组意见仍有效');
+            assert.strictEqual(mv.groups[0].judgment.baseMsId, mB.id, '底本锚点切到新底本');
+            assert.strictEqual(mv.groups[0].judgment.chosenMsId, mB.id, '所选抄本不变（此时即底本）');
+            // 在乙本行片段内部（第2字处 [2,2)）插入「曰」：严格位于片段 [0,5) 内部 → 组待修复 → 意见待复核
+            mver = mv.document.version;
+            r = await call(base, 'PUT', `/lines/${mb1}`, { expectedVersion: mver, startCp: 2, endCp: 2, replacement: '曰' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            assert.strictEqual(mv.groups[0].broken, true);
+            assert.strictEqual(mv.groups[0].judgment.status, 'review');
+            // 修复组1（乙新文「天命曰之謂道」，片段 [0,5)=天命曰之謂、[2,7)？取含「天命之謂道」的等长段）
+            mver = mv.document.version;
+            const mAfterB = (await call(base, 'GET', `/documents/${dM}`)).json.rawByMs.find((x) => x.msId === mB.id).lines[0].lineId;
+            // 新文为「天命曰之謂道」（7字），引用「天命之謂道」无法原样恢复 → 改为撤回后重判更贴近真实；
+            // 这里直接修复为保留原引用文字的布局：甲插入同字以保持两本同文不现实，
+            // 故修复为乙片段 [0,5)「天命曰之謂」会使引用改变。为验证“引用未变即可确认”，
+            // 改为把插入字删掉回到「天命之謂道」，再修复同构区间。
+            r = await call(base, 'PUT', `/lines/${mb1}`, { expectedVersion: mver, startCp: 2, endCp: 3, replacement: '' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            mver = (await call(base, 'GET', `/documents/${dM}`)).json.document.version;
+            r = await call(base, 'PUT', `/documents/${dM}/groups/${mg1}/repair`, {
+                expectedVersion: mver,
+                group: { ord: 1, fragments: [
+                        { msId: mA.id, lineId: ma1, startCp: 0, endCp: 5 },
+                        { msId: mB.id, lineId: mAfterB, startCp: 0, endCp: 5 },
+                    ] },
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            assert.strictEqual(mv.groups[0].judgment.status, 'review', '修复后仍待人确认');
+            mver = mv.document.version;
+            // 存储引用「天命之謂道」== 乙片段 [0,5) 文字「天命之謂道」→ 重新确认成功
+            r = await call(base, 'POST', `/documents/${dM}/judgments/${mv.groups[0].judgment.id}/reconfirm`, {
+                expectedVersion: mver,
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            mv = (await call(base, 'GET', `/documents/${dM}`)).json;
+            assert.strictEqual(mv.groups[0].judgment.status, 'confirmed');
+            assert.strictEqual(mv.groups[0].judgment.frozen, false, '人工重新确认后为工作版意见（不再冻结）');
+            assert.deepStrictEqual([mv.groups[0].judgment.chosenLineNo, mv.groups[0].judgment.chosenStartCp, mv.groups[0].judgment.chosenEndCp], [1, 0, 5], '重新确认刷新到当前片段位置');
+        }
+        // ---------- 判读意见：未裁定意见在组待修复后也待复核，且阻断发布 ----------
+        {
+            r = await call(base, 'POST', '/documents', { title: `未裁定门禁 ${++seq}`, manuscripts: ['甲本', '乙本'] });
+            assert.strictEqual(r.status, 201);
+            const dU = r.json.id;
+            let uv = (await call(base, 'GET', `/documents/${dU}`)).json;
+            const uA = uv.manuscripts[0], uB = uv.manuscripts[1];
+            let uver = uv.document.version;
+            await call(base, 'POST', `/manuscripts/${uA.id}/lines`, { expectedVersion: uver++, content: 'AB' });
+            await call(base, 'POST', `/manuscripts/${uB.id}/lines`, { expectedVersion: uver++, content: 'AB' });
+            uv = (await call(base, 'GET', `/documents/${dU}`)).json;
+            const ua1 = uv.rawByMs.find((x) => x.msId === uA.id).lines[0].lineId;
+            const ub1 = uv.rawByMs.find((x) => x.msId === uB.id).lines[0].lineId;
+            r = await call(base, 'PUT', `/documents/${dU}/groups`, {
+                expectedVersion: uv.document.version,
+                groups: [{ ord: 1, fragments: [
+                            { msId: uA.id, lineId: ua1, startCp: 0, endCp: 2 },
+                            { msId: uB.id, lineId: ub1, startCp: 0, endCp: 2 },
+                        ] }],
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            uv = (await call(base, 'GET', `/documents/${dU}`)).json;
+            r = await call(base, 'PUT', `/documents/${dU}/groups/${uv.groups[0].id}/judgment`, {
+                expectedVersion: uv.document.version, decided: false, reason: '存疑待考',
+            });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            // 未裁定可发布（没有待复核意见）
+            uv = (await call(base, 'GET', `/documents/${dU}`)).json;
+            r = await call(base, 'POST', `/documents/${dU}/publish`, { expectedVersion: uv.document.version });
+            assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+            // 改甲本行相交 → 组待修复 → 未裁定意见也待复核
+            uv = (await call(base, 'GET', `/documents/${dU}`)).json;
+            r = await call(base, 'PUT', `/lines/${ua1}`, { expectedVersion: uv.document.version, startCp: 0, endCp: 1, replacement: 'X' });
+            assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+            uv = (await call(base, 'GET', `/documents/${dU}`)).json;
+            assert.strictEqual(uv.groups[0].judgment.status, 'review');
+            assert.strictEqual(uv.stats.judgmentReviewCount, 1);
+            r = await call(base, 'POST', `/documents/${dU}/publish`, { expectedVersion: uv.document.version });
+            await expectFail(r, 409, '不得发布');
+        }
+        // ---------- 判读意见：归档迁移 ----------
+        {
+            // 用归档文献 dArc（已有快照）追加一条意见再导出
+            arcView = (await call(base, 'GET', `/documents/${dArc}`)).json;
+            const arcVer2 = arcView.document.version;
+            const arcIntactG = arcView.groups.find((g) => !g.broken);
+            if (arcIntactG) {
+                const arcBase = arcView.manuscripts.find((m) => m.isBase);
+                r = await call(base, 'PUT', `/documents/${dArc}/groups/${arcIntactG.id}/judgment`, {
+                    expectedVersion: arcVer2, decided: true, chosenMsId: arcBase.id, reason: '归档意见随迁',
+                });
+                assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+                const exp = await call(base, 'GET', `/documents/${dArc}/archive`);
+                assert.strictEqual(exp.status, 200);
+                assert.ok(Array.isArray(exp.json.judgments));
+                const jrow = exp.json.judgments.find((x) => x.reason === '归档意见随迁');
+                assert.ok(jrow, '归档含工作版判读意见');
+                assert.strictEqual(jrow.decided, true);
+                assert.ok(jrow.quoteText.length > 0);
+                // 导入 → 意见对应到新文献完好组
+                r = await call(base, 'POST', '/documents/documents/import'.replace('/documents/documents', '/documents'), exp.json);
+                assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+                const dJImp = r.json.documentId;
+                const impj = (await call(base, 'GET', `/documents/${dJImp}`)).json;
+                const attached = impj.groups.find((g) => g.judgment && g.judgment.reason === '归档意见随迁');
+                assert.ok(attached, '导入后意见挂到对应新组（非孤儿）');
+                assert.strictEqual(attached.judgment.status, 'confirmed');
+                assert.strictEqual(attached.judgment.chosenMsName, attached.judgment.chosenMsName && impj.manuscripts.find((m) => m.id === attached.judgment.chosenMsId).name);
+            }
+        }
+        // ---------- 判读意见：旧格式归档（无 judgments 节）仍可导入 ----------
+        {
+            const exp = await call(base, 'GET', `/documents/${dArc}/archive`);
+            const oldFmt = exp.json;
+            delete oldFmt.judgments;
+            r = await call(base, 'POST', '/api/documents/import'.replace('/api', ''), oldFmt);
+            assert.strictEqual(r.status, 201, '旧格式归档（无 judgments）仍可导入: ' + JSON.stringify(r.json));
+        }
         console.log('✅ 全部集成测试通过');
     }
     finally {

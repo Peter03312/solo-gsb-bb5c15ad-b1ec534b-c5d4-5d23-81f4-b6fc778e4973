@@ -4,6 +4,7 @@ import {
   CollationView,
   DocumentRow,
   GroupDTO,
+  JudgmentRow,
 } from './types';
 import { HttpError, isInt } from './util';
 import { validateGroups } from './validate';
@@ -77,6 +78,13 @@ export async function buildArchive(
     'SELECT edition_no, snapshot, created_at FROM editions WHERE doc_id=$1 ORDER BY edition_no',
     [doc.id]
   );
+  // 工作版判读意见：组归属以底本片段位置（msRef+行号+码点+文字）锚定记录，
+  // 导入时按新文献组唯一配对挂载；孤儿（group_id 为空）也原样带出，仍为待复核。
+  const { rows: judgments } = await client.query<JudgmentRow>(
+    'SELECT * FROM group_judgments WHERE doc_id=$1 ORDER BY id',
+    [doc.id]
+  );
+  const ordByGroup = new Map(groups.map((g) => [g.id, g.ord]));
 
   return {
     format: ARCHIVE_FORMAT,
@@ -102,6 +110,24 @@ export async function buildArchive(
           startCp: f.missing ? null : f.start_cp,
           endCp: f.missing ? null : f.end_cp,
         })),
+    })),
+    judgments: judgments.map((j) => ({
+      decided: j.decided,
+      reason: j.reason,
+      quoteText: j.quote_text,
+      needsReview: j.needs_review,
+      reviewReason: j.review_reason,
+      frozen: j.frozen,
+      baseMsRef: j.base_ms_id,
+      baseLineNo: j.base_line_no,
+      baseStartCp: j.base_start_cp,
+      baseEndCp: j.base_end_cp,
+      baseText: j.base_text,
+      chosenMsRef: j.chosen_ms_id,
+      chosenLineNo: j.chosen_line_no,
+      chosenStartCp: j.chosen_start_cp,
+      chosenEndCp: j.chosen_end_cp,
+      lastOrd: j.group_id != null ? ordByGroup.get(j.group_id) ?? j.last_ord : j.last_ord,
     })),
     editions: editions.map((e) => ({
       editionNo: e.edition_no,
@@ -137,6 +163,26 @@ interface PlanGroup {
   fragments: PlanFragment[];
 }
 
+/** 判读意见（归档层，容错解析；旧格式归档无此节）。 */
+interface PlanJudgment {
+  decided: boolean;
+  reason: string;
+  quoteText: string;
+  needsReview: boolean;
+  reviewReason: string;
+  frozen: boolean;
+  baseMsRef: number | null;
+  baseLineNo: number | null;
+  baseStartCp: number | null;
+  baseEndCp: number | null;
+  baseText: string;
+  chosenMsRef: number | null;
+  chosenLineNo: number | null;
+  chosenStartCp: number | null;
+  chosenEndCp: number | null;
+  lastOrd: number | null;
+}
+
 export interface ArchivePlan {
   title: string;
   version: number;
@@ -145,6 +191,7 @@ export interface ArchivePlan {
   manuscripts: Array<{ ref: number; name: string; position: number }>;
   lines: Array<{ ref: number; msRef: number; lineNo: number; content: string }>;
   groups: PlanGroup[];
+  judgments: PlanJudgment[];
   editions: Array<{ editionNo: number; createdAt: string | null; snapshot: CollationView }>;
 }
 
@@ -648,6 +695,42 @@ export function validateArchive(input: unknown): ArchivePlan {
 
   if (issues.length > 0) fail(issues);
 
+  // ---- 7. 工作版判读意见（可选节：旧格式归档无 judgments → 空；坏条目不阻断导入，保留为待复核孤儿）----
+  const judgments: PlanJudgment[] = [];
+  const rawJudgments = (a as Record<string, unknown>).judgments;
+  if (rawJudgments !== undefined) {
+    if (!Array.isArray(rawJudgments)) {
+      // 结构错误不阻断旧格式容错：忽略该节
+    } else {
+      rawJudgments.forEach((x) => {
+        if (!x || typeof x !== 'object') return;
+        const jj = x as Record<string, unknown>;
+        const str = (v: unknown) => (typeof v === 'string' ? v : '');
+        const intOrNull = (v: unknown) => (isInt(v) ? v : null);
+        judgments.push({
+          decided: jj.decided === true,
+          reason: str(jj.reason),
+          quoteText: str(jj.quoteText),
+          needsReview: jj.needsReview === true,
+          reviewReason: str(jj.reviewReason),
+          frozen: jj.frozen === true,
+          baseMsRef: intOrNull(jj.baseMsRef),
+          baseLineNo: intOrNull(jj.baseLineNo),
+          baseStartCp: intOrNull(jj.baseStartCp),
+          baseEndCp: intOrNull(jj.baseEndCp),
+          baseText: str(jj.baseText),
+          chosenMsRef: intOrNull(jj.chosenMsRef),
+          chosenLineNo: intOrNull(jj.chosenLineNo),
+          chosenStartCp: intOrNull(jj.chosenStartCp),
+          chosenEndCp: intOrNull(jj.chosenEndCp),
+          lastOrd: intOrNull(jj.lastOrd),
+        });
+      });
+    }
+  }
+
+  if (issues.length > 0) fail(issues);
+
   return {
     title,
     version,
@@ -656,6 +739,7 @@ export function validateArchive(input: unknown): ArchivePlan {
     manuscripts,
     lines,
     groups,
+    judgments,
     editions,
   };
 }
@@ -674,6 +758,8 @@ export interface ArchiveApplyResult {
     brokenGroupCount: number;
     fragmentCount: number;
     missingCount: number;
+    judgmentCount: number;
+    judgmentReviewCount: number;
     editionCount: number;
   };
 }
@@ -720,12 +806,14 @@ export async function applyArchive(
   // 对应组与片段：待修复状态、缺文标记与（待修复组的）越界坐标原样保留
   let fragmentCount = 0;
   let missingCount = 0;
+  const groupIdByOrd = new Map<number, number>();
   for (const g of [...plan.groups].sort((a, b) => a.ord - b.ord)) {
     const { rows } = await client.query<{ id: number }>(
       'INSERT INTO grp (doc_id, ord, broken) VALUES ($1,$2,$3) RETURNING id',
       [docId, g.ord, g.broken]
     );
     const gid = rows[0].id;
+    groupIdByOrd.set(g.ord, gid);
     for (const f of g.fragments) {
       fragmentCount++;
       if (f.missing) {
@@ -741,6 +829,97 @@ export async function applyArchive(
         );
       }
     }
+  }
+
+  // 工作版判读意见：抄本引用重建；按底本片段位置（新抄本 id + 行号 + 码点）在新文献组中唯一配对。
+  // 配对唯一且（已裁定）引用文字未变 → 挂到对应新组；否则保留为待复核孤儿，绝不静默移到别组。
+  const { rows: newFrags } = await client.query<{
+    group_id: number; ms_id: number; line_id: number | null;
+    start_cp: number | null; end_cp: number | null; missing: boolean;
+  }>(
+    `SELECT f.group_id, f.ms_id, f.line_id, f.start_cp, f.end_cp, f.missing
+       FROM fragments f JOIN grp g ON g.id=f.group_id
+      WHERE f.doc_id=$1 AND g.broken=FALSE AND f.missing=FALSE`,
+    [docId]
+  );
+  const { rows: newLinesForIdx } = await client.query<{ id: number; ms_id: number; line_no: number; content: string }>(
+    'SELECT id, ms_id, line_no, content FROM lines WHERE ms_id = ANY($1::bigint[])',
+    [[...msIdMap.values()]]
+  );
+  const newLineById = new Map(newLinesForIdx.map((l) => [l.id, l]));
+  const baseLocGroups = new Map<string, number[]>();
+  for (const f of newFrags) {
+    const ln = f.line_id != null ? newLineById.get(f.line_id) : undefined;
+    if (!ln || f.start_cp == null || f.end_cp == null) continue;
+    const key = `${f.ms_id}:${ln.line_no}:${f.start_cp}:${f.end_cp}`;
+    const arr = baseLocGroups.get(key) ?? [];
+    arr.push(f.group_id);
+    baseLocGroups.set(key, arr);
+  }
+  const groupOrdById = new Map([...groupIdByOrd].map(([ord, gid]) => [gid, ord]));
+  let judgmentCount = 0;
+  let judgmentReviewCount = 0;
+  for (const j of plan.judgments) {
+    judgmentCount++;
+    const baseMsId = j.baseMsRef != null ? msIdMap.get(j.baseMsRef) ?? null : null;
+    const chosenMsId = j.chosenMsRef != null ? msIdMap.get(j.chosenMsRef) ?? null : null;
+
+    let attachGid: number | null = null;
+    let chosenLineId: number | null = null;
+    let needsReview = j.needsReview;
+    let reviewReason = j.reviewReason;
+
+    if (!needsReview && baseMsId != null && j.baseLineNo != null && j.baseStartCp != null && j.baseEndCp != null) {
+      const hits = baseLocGroups.get(`${baseMsId}:${j.baseLineNo}:${j.baseStartCp}:${j.baseEndCp}`) ?? [];
+      if (hits.length === 1) {
+        const gid = hits[0];
+        let ok = true;
+        if (j.decided) {
+          if (chosenMsId == null) {
+            ok = false;
+          } else {
+            const cf = newFrags.find((f) => f.group_id === gid && f.ms_id === chosenMsId);
+            const cln = cf?.line_id != null ? newLineById.get(cf.line_id) : undefined;
+            if (!cf || !cln || cf.start_cp == null || cf.end_cp == null || cln.line_no !== j.chosenLineNo) {
+              ok = false;
+            } else {
+              chosenLineId = cln.id;
+              const text = Array.from(cln.content).slice(cf.start_cp, cf.end_cp).join('');
+              if (text !== j.quoteText) ok = false;
+            }
+          }
+        }
+        if (ok) attachGid = gid;
+      }
+      if (attachGid == null) {
+        needsReview = true;
+        reviewReason =
+          reviewReason ||
+          '归档迁移后原组或所选片段无法唯一对应（或引用文字已变）：请重新确认或撤回，意见未移到其他组';
+      }
+    } else if (!needsReview) {
+      needsReview = true;
+      reviewReason = reviewReason || '归档缺少组锚点：请重新确认或撤回本意见';
+    }
+    if (needsReview) judgmentReviewCount++;
+
+    await client.query(
+      `INSERT INTO group_judgments
+         (doc_id, group_id, chosen_ms_id, chosen_line_id, decided, reason, quote_text,
+          base_ms_id, base_line_no, base_start_cp, base_end_cp, base_text,
+          chosen_line_no, chosen_start_cp, chosen_end_cp,
+          needs_review, review_reason, frozen, last_ord)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+      [
+        docId, needsReview ? null : attachGid,
+        chosenMsId, needsReview ? null : chosenLineId,
+        j.decided, j.reason, j.quoteText,
+        baseMsId, j.baseLineNo, j.baseStartCp, j.baseEndCp, j.baseText,
+        j.chosenLineNo, j.chosenStartCp, j.chosenEndCp,
+        needsReview, reviewReason, j.frozen,
+        attachGid != null ? groupOrdById.get(attachGid) ?? j.lastOrd : j.lastOrd,
+      ]
+    );
   }
 
   // 快照内的抄本引用重建：当前工作版抄本 → 新 id；
@@ -780,12 +959,14 @@ export async function applyArchive(
       brokenGroupCount: plan.groups.filter((g) => g.broken).length,
       fragmentCount,
       missingCount,
+      judgmentCount,
+      judgmentReviewCount,
       editionCount: plan.editions.length,
     },
   };
 }
 
-/** 把快照中的文献 id / 底本引用 / 全部抄本引用重建为新文献的标识（其余内容原样保留）。 */
+/** 把快照中的文献 id / 底本引用 / 全部抄本引用（含判读意见中的抄本引用）重建为新文献标识。 */
 function remapSnapshotMsIds(
   snapshot: unknown,
   newDocId: number,
@@ -793,6 +974,17 @@ function remapSnapshotMsIds(
 ): unknown {
   const v = snapshot as CollationView;
   if (!v || typeof v !== 'object') return snapshot;
+  const remapJudgment = (j: unknown) => {
+    if (!j || typeof j !== 'object') return j;
+    const jj = j as Record<string, unknown>;
+    return {
+      ...jj,
+      baseMsId: typeof jj.baseMsId === 'number' ? mapMs(jj.baseMsId) : jj.baseMsId ?? null,
+      chosenMsId: typeof jj.chosenMsId === 'number' ? mapMs(jj.chosenMsId) : jj.chosenMsId ?? null,
+      baseMsName: jj.baseMsName ?? null,
+      chosenMsName: jj.chosenMsName ?? null,
+    };
+  };
   return {
     ...v,
     document: {
@@ -804,7 +996,9 @@ function remapSnapshotMsIds(
     groups: (v.groups ?? []).map((g) => ({
       ...g,
       cells: (g.cells ?? []).map((c) => ({ ...c, msId: mapMs(c.msId) })),
+      judgment: remapJudgment((g as { judgment?: unknown }).judgment),
     })),
+    orphanJudgments: ((v as { orphanJudgments?: unknown[] }).orphanJudgments ?? []).map(remapJudgment),
     rawByMs: (v.rawByMs ?? []).map((r) => ({ ...r, msId: mapMs(r.msId) })),
   };
 }

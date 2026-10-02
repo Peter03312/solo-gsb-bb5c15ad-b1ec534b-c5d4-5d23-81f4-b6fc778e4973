@@ -218,3 +218,17 @@ input:focus, textarea:focus { outline: 2px solid #d9c9a8; }
 .unpaired-cells { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 2px 14px; }
 .unpaired-cell { font-size: 14px; }
 .unpaired-cell .msname { display: inline-block; min-width: 70px; font-weight: 600; }
+
+/* ---- 判读意见 ---- */
+.judgment-cell { margin-top: 6px; display: block; }
+.judgment-confirmed, .judgment-undecided, .judgment-review { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+.judgment-quote { font-size: 14px; color: var(--blue); }
+.judgment-reason { font-size: 12px; color: var(--ink-soft); white-space: pre-wrap; }
+.judgment-review .judgment-reason { color: var(--warn); }
+.judgment-edit { display: flex; flex-direction: column; gap: 6px; align-items: stretch; min-width: 220px; }
+.judgment-edit textarea { resize: vertical; }
+.judgment-orphans { border-left: 4px solid var(--warn); margin-top: 18px; }
+.judgment-orphan-row {
+  display: flex; justify-content: space-between; gap: 12px; align-items: flex-start;
+  border-top: 1px dashed var(--line); padding: 8px 0; flex-wrap: wrap;
+}
