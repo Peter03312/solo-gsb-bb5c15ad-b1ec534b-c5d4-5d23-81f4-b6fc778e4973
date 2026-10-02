@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: collation-db
+    environment:
+      POSTGRES_USER: ${PGUSER:-collation}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-collation}
+      POSTGRES_DB: ${PGDATABASE:-collation}
+    volumes:
+      - collation-pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-collation} -d ${PGDATABASE:-collation}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: collation-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${PGUSER:-collation}
+      PGPASSWORD: ${PGPASSWORD:-collation}
+      PGDATABASE: ${PGDATABASE:-collation}
+      PORT: 4000
+      SCHEMA_FILE: /db/schema.sql
+    ports:
+      - "${APP_PORT:-4000}:4000"
+    restart: unless-stopped
+
+volumes:
+  collation-pgdata:
